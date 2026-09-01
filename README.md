@@ -8,3 +8,4 @@ for the result. Run manually anytime from the Actions tab ("Run workflow").
 
 Credentials are stored as encrypted repository secrets (Settings > Secrets and variables > Actions),
 never committed to the repo.
+
