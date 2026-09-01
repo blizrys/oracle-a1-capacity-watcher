@@ -2,7 +2,7 @@ name: Retry Ampere A1 launch
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 permissions:
