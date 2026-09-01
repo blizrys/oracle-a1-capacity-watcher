@@ -1,0 +1,98 @@
+name: Retry Ampere A1 launch
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: oci-a1-retry
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if already succeeded
+        id: check
+        run: |
+          if [ -f SUCCESS ]; then
+            echo "already_succeeded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_succeeded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.check.outputs.already_succeeded == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OCI CLI
+        if: steps.check.outputs.already_succeeded == 'false'
+        run: pip install oci-cli
+
+      - name: Configure OCI credentials
+        if: steps.check.outputs.already_succeeded == 'false'
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          printf '%s' "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/config ~/.oci/oci_api_key.pem
+
+      - name: Attempt instance launch
+        if: steps.check.outputs.already_succeeded == 'false'
+        id: launch
+        run: |
+          set +e
+          OUTPUT=$(oci compute instance launch \
+            --compartment-id "${{ secrets.OCI_TENANCY_OCID }}" \
+            --availability-domain "${{ secrets.OCI_AD }}" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+            --image-id "${{ secrets.OCI_IMAGE_ID }}" \
+            --subnet-id "${{ secrets.OCI_SUBNET_ID }}" \
+            --assign-public-ip true \
+            --metadata "{\"ssh_authorized_keys\":\"${{ secrets.OCI_SSH_PUBLIC_KEY }}\"}" \
+            --display-name "remoteai-instance" \
+            --boot-volume-size-in-gbs 50 2>&1)
+          EXIT_CODE=$?
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -qiE "out of host capacity|OutOfHostCapacity|out of capacity"; then
+            echo "result=capacity" >> "$GITHUB_OUTPUT"
+          elif [ $EXIT_CODE -eq 0 ] && echo "$OUTPUT" | grep -q '"id":'; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+            echo "$OUTPUT" > instance.json
+          else
+            echo "result=error" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get public IP on success
+        if: steps.launch.outputs.result == 'success'
+        run: |
+          INSTANCE_ID=$(python3 -c "import json;print(json.load(open('instance.json'))['data']['id'])")
+          sleep 20
+          oci compute instance list-vnics --instance-id "$INSTANCE_ID" --query "data[0].\"public-ip\"" --raw-output > public_ip.txt || echo "pending" > public_ip.txt
+          cat public_ip.txt
+
+      - name: Commit success state
+        if: steps.launch.outputs.result == 'success'
+        run: |
+          touch SUCCESS
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          git add SUCCESS instance.json public_ip.txt
+          git commit -m "Instance launched successfully"
+          git push
